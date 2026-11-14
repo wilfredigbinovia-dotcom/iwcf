@@ -1,20 +1,110 @@
 """Lucy C6 well design – Streamlit app.
 
 Run with:   streamlit run lucy_c6_app.py
-Needs:      pip install streamlit numpy pandas matplotlib
+Needs:      streamlit only (numpy, pandas and altair come with it)
 """
 import math, json
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import altair as alt
 import streamlit as st
 
 st.set_page_config(page_title='Lucy C6 Well Design', layout='wide')
 
 RIGS = {'Ensco 120': 115000, 'Ensco 70': 98000, 'Transocean Monarch': 105000,
         'Transocean GSF Galaxy II': 124000, 'Rowan Gorilla V': 127000}
+
+
+# ------------------------------------------------------------------ bit design engine
+CD = 0.95          # nozzle discharge coefficient
+HSI_FRAC = 0.65    # theoretical optimum (max bit HHP); design uses a lower per-section fraction to leave room for
+                   # parasitic losses that grow with depth, underreamer and MPD choke
+
+BITS = [
+ dict(sec='26"', hole=26.0, frm=500, to=2500, bit='Milled-tooth roller cone', iadc='115', blades='3 cones', cutters='Steel teeth, hardfaced',
+      lith='Soft shale, unconsolidated sand', why='Soft, sticky top hole; aggressive long teeth, low cost; balling resistance from open jets',
+      wob='20–40', rpm='80–120', q=1100, mw=9.2, spp=4000, frac=0.55, nn=4, dp=5.5, ann=26.0),
+ dict(sec='17-1/2"', hole=17.5, frm=2500, to=5300, bit='PDC (steel body)', iadc='M323', blades='6 blades', cutters='19 mm, single row',
+      lith='Reactive shale, sand stringers', why='Shear cutting in shale is fastest; one-run section on motor; OBM prevents balling',
+      wob='10–25', rpm='120–180 (motor)', q=1000, mw=10.2, spp=5000, frac=0.50, nn=6, dp=5.5, ann=17.5),
+ dict(sec='12-1/4" x 14-1/2"', hole=12.25, frm=5300, to=5900, bit='TCI roller cone + hydraulic underreamer', iadc='517', blades='3 cones', cutters='Chisel inserts, gauge protected',
+      lith='Fractured / vugular limestone', why='Impact-tolerant inserts survive fractured carbonate; low torque under MPD and losses',
+      wob='30–45', rpm='80–110', q=800, mw=10.6, spp=5000, frac=0.40, nn=3, dp=5.5, ann=14.5),
+ dict(sec='10-5/8" x 12-1/4"', hole=10.625, frm=5900, to=11800, bit='PDC (matrix body) + underreamer', iadc='M323', blades='7 blades', cutters='16 mm, backup row',
+      lith='Shale, mobile salt', why='Matrix body for erosion; backup cutters for durability; 2 runs (fresh bit before salt); stable on RSS',
+      wob='10–25', rpm='140–180 (RSS)', q=750, mw=12.8, spp=5000, frac=0.35, nn=7, dp=5.5, ann=12.25),
+ dict(sec='8-1/2"', hole=8.5, frm=11800, to=12500, bit='PDC (matrix body)', iadc='M433', blades='6 blades', cutters='13 mm, impact-resistant',
+      lith='Limestone, target sandstone', why='Smaller cutters and more blades for harder, interbedded rock; good dull grade for coring/logging',
+      wob='8–20', rpm='120–160 (RSS)', q=500, mw=13.3, spp=5000, frac=0.35, nn=6, dp=5.0, ann=8.5),
+]
+
+
+def tfa(sizes):
+    return sum(math.pi / 4 * (s / 32) ** 2 for s in sizes)
+
+
+def best_nozzles(n, a_req):
+    best = None
+    for a in range(8, 32):
+        for k in range(n + 1):
+            sizes = [a] * k + [a + 1] * (n - k)
+            err = abs(tfa(sizes) - a_req)
+            if best is None or err < best[0]:
+                best = (err, sizes)
+    return best[1]
+
+
+def hydraulics(b):
+    q, mw = b['q'], b['mw']
+    dp_target = b['frac'] * b['spp']
+    a_req = math.sqrt(mw * q ** 2 / (12031 * CD ** 2 * dp_target))
+    sizes = best_nozzles(b['nn'], a_req)
+    a = tfa(sizes)
+    dpb = mw * q ** 2 / (12031 * CD ** 2 * a ** 2)
+    vn = 0.3208 * q / a
+    hhp = dpb * q / 1714
+    hsi = hhp / (math.pi / 4 * b['hole'] ** 2)
+    imp = 0.01823 * CD * q * math.sqrt(mw * dpb)
+    av = 24.51 * q / (b['ann'] ** 2 - b['dp'] ** 2)
+    counts = {}
+    for s in sizes: counts[s] = counts.get(s, 0) + 1
+    noz = ' + '.join(f'{c}×{s}/32"' for s, c in sorted(counts.items()))
+    return dict(dp_target=round(dp_target), tfa_req=round(a_req, 3), nozzles=noz, tfa=round(a, 3), dp_bit=round(dpb),
+                pct_spp=round(dpb / b['spp'] * 100, 1), vn=round(vn), hhp=round(hhp), hsi=round(hsi, 2), impact=round(imp), av=round(av))
+
+
+def economics(b, rop_ftday, trip_hr, spread_per_day, bit_rate):
+    footage = b['to'] - b['frm']
+    drill_hr = footage / rop_ftday * 24
+    bit_cost = footage * bit_rate
+    cpf = (bit_cost + spread_per_day / 24 * (drill_hr + trip_hr)) / footage
+    return dict(footage=footage, drill_hr=round(drill_hr, 1), trip_hr=round(trip_hr, 1), bit_cost=round(bit_cost), cpf=round(cpf))
+
+
+def drill_hours(a, b):
+    h = 0; d = a
+    while d < b:
+        rop = 900 if d < 6000 else 750 if d < 9000 else 540 if d < 12200 else 380
+        nxt = min(b, 6000 if d < 6000 else 9000 if d < 9000 else 12200 if d < 12200 else b)
+        h += (nxt - d) / rop * 24; d = nxt
+    return h
+
+
+def design(spread_per_day, stand_ft=90, trip_spd=12):
+    out = []
+    for b in BITS:
+        h = hydraulics(b)
+        footage = b['to'] - b['frm']
+        drill_hr = drill_hours(b['frm'], b['to'])
+        n_runs = 2 if b['sec'].startswith('10-5/8') else 1
+        trip_hr = sum(2 * d / stand_ft / trip_spd for d in ([b['frm']] + ([9000] if n_runs == 2 else [])))
+        rate = 28 if b['hole'] >= 17.5 else 17
+        bit_cost = footage * rate
+        cpf = (bit_cost + spread_per_day / 24 * (drill_hr + trip_hr)) / footage
+        out.append({**b, **h, 'runs': n_runs, 'footage': footage, 'drill_hr': round(drill_hr, 1), 'trip_hr': round(trip_hr, 1),
+                    'bit_cost': round(bit_cost), 'cpf': round(cpf)})
+    return out
+
 
 
 @st.cache_data
@@ -378,26 +468,37 @@ c3.metric('AFE (P50)', f"${R['afe_total']/1e6:.2f}M", f"${(R['afe_total']+R['con
 c4.metric('Min kick tolerance', f"{min(k['kt_bbl'] for k in R['kt']):.0f} bbl")
 
 INK = '#1f2933'
-def depth_axis(ax, top=0, bot=12800):
-    ax.set_ylim(bot, top); ax.grid(True, color='#e5e7eb'); ax.spines[['top', 'right']].set_visible(False)
+def ydepth(title='Depth (ft TVD RKB)', bot=12800):
+    return alt.Y('Depth:Q', title=title, scale=alt.Scale(reverse=True, domain=[0, bot]))
 
-tabs = st.tabs(['PP / FG / MW', 'Casing & kick tolerance', 'Production casing', 'Cement & mud', 'Time & AFE', 'Relief well'])
+def lines(df, x, xtitle, xdom, colors, bot=12800, height=650):
+    return alt.Chart(df).mark_line(strokeWidth=2.5).encode(
+        x=alt.X(f'{x}:Q', title=xtitle, scale=alt.Scale(domain=xdom)), y=ydepth(bot=bot),
+        color=alt.Color('Series:N', scale=alt.Scale(domain=list(colors), range=list(colors.values())), legend=alt.Legend(orient='bottom')),
+        strokeDash=alt.StrokeDash('Dash:N', legend=None), order='i:Q', detail='Series:N',
+        tooltip=['Series', alt.Tooltip(f'{x}:Q', format=',.2f'), alt.Tooltip('Depth:Q', format=',')]).properties(height=height)
+
+def rows(series, xs, ds, dash='solid'):
+    return [dict(Series=series, X=x, Depth=d, i=i, Dash=dash) for i, (x, d) in enumerate(zip(xs, ds))]
+
+tabs = st.tabs(['PP / FG / MW', 'Casing & kick tolerance', 'Production casing', 'Bit design', 'Cement & mud', 'Time & AFE', 'Relief well'])
 
 # ------------------------------------------------------------------ PPFG
 with tabs[0]:
     D, PP, FG = R['D'], R['PP'], R['FG']
     mw_steps = [(500, 2500, 9.2), (2500, 5300, 10.2), (5300, 5900, 10.6), (5900, 9000, 12.0), (9000, 11000, 12.3), (11000, 11800, 12.8), (11800, 12500, 13.3)]
-    fig, ax = plt.subplots(figsize=(7, 8))
-    ax.plot(PP, D, color='#2563eb', lw=2, label='Pore pressure')
-    ax.plot(FG, D, color='#dc2626', lw=2, label='Fracture gradient')
-    for i, (a, b, w) in enumerate(mw_steps):
-        ax.plot([w, w], [a, b], color='#16a34a', lw=2.5, label='Mud weight' if i == 0 else None)
-    ax.scatter([l[2] for l in R['lot']], [l[0] for l in R['lot']], marker='D', color='#9333ea', label='Offset LOT', zorder=5)
-    for s in R['strings']:
-        ax.axhline(s['shoe'], color=INK, lw=0.6, ls='--'); ax.text(8.1, s['shoe'] - 60, f"{s['name']} @ {s['shoe']:,}", fontsize=8)
-    ax.set_xlim(8, 17.5); depth_axis(ax); ax.set_xlabel('ppg'); ax.set_ylabel('Depth (ft TVD RKB)'); ax.legend(loc='lower left', fontsize=8)
+    mx, md = [], []
+    for k, (a_, b_, w) in enumerate(mw_steps):
+        mx += [w, w]; md += [a_, b_]
+    df = pd.DataFrame(rows('Pore pressure', PP, D) + rows('Fracture gradient', FG, D) + rows('Mud weight', mx, md))
+    ch = lines(df, 'X', 'Equivalent density (ppg)', [8, 17.5], {'Pore pressure': '#2563eb', 'Fracture gradient': '#dc2626', 'Mud weight': '#16a34a'})
+    lot = alt.Chart(pd.DataFrame([dict(X=l[2], Depth=l[0]) for l in R['lot']])).mark_point(shape='diamond', filled=True, size=80, color='#9333ea').encode(x='X:Q', y=ydepth())
+    shoes = pd.DataFrame([dict(Depth=s['shoe'], Label=f"{s['name']} @ {s['shoe']:,}") for s in R['strings']])
+    rule = alt.Chart(shoes).mark_rule(strokeDash=[4, 3], color=INK).encode(y=ydepth())
+    lab = alt.Chart(shoes).mark_text(align='left', dx=4, dy=-6, fontSize=10).encode(y=ydepth(), x=alt.datum(8), text='Label')
+    fig = ch + lot + rule + lab
     col1, col2 = st.columns([1.2, 1])
-    col1.pyplot(fig)
+    col1.altair_chart(fig, width='stretch')
     col2.subheader('Geology (Appendix 1)')
     col2.dataframe(pd.DataFrame(R['geo'], columns=['Depth (ft)', 'Lithology', 'PP (ppg)', 'FG (ppg)']), hide_index=True, height=600)
 
@@ -417,27 +518,63 @@ with tabs[2]:
     m1, m2, m3 = st.columns(3)
     m1.metric('Min SF burst', p['min_sf_burst']); m2.metric('Min SF collapse', p['min_sf_collapse']); m3.metric('SF tension', p['sf_tension'])
     z = np.array(R['z'])
-    fig, axs = plt.subplots(1, 2, figsize=(11, 6.5), sharey=True)
-    for ax, load, rating, t, c in [(axs[0], R['net_burst'], R['burst_rating'], 'Burst', '#dc2626'), (axs[1], R['net_collapse'], R['coll_rating'], 'Collapse', '#2563eb')]:
-        ax.plot(load, z, color=c, lw=2, label='Net load'); ax.plot(load * 1.1, z, color=c, ls='--', lw=1, label='Design load ×1.1')
-        ax.plot(rating, z, color=INK, lw=2, label='Rating'); ax.axhspan(9500, 9900, color='#f9a8d4', alpha=0.4, lw=0)
-        ax.set_title(t, loc='left'); ax.set_xlim(0, 15000); ax.set_xlabel('psi'); depth_axis(ax, 0, 11800); ax.legend(loc='lower right', fontsize=8)
-    st.pyplot(fig)
+    lc = st.columns(2)
+    for col, load, rating, ttl, c in [(lc[0], R['net_burst'], R['burst_rating'], 'Burst', '#dc2626'), (lc[1], R['net_collapse'], R['coll_rating'], 'Collapse', '#2563eb')]:
+        load = np.asarray(load, float); rating = np.asarray(rating, float)
+        df = pd.DataFrame(rows('Net load', load, z) + rows('Design load ×1.1', load * 1.1, z, 'dash') + rows('Rating', rating, z))
+        col.markdown(f'**{ttl}** (salt 9,500–9,900 ft shaded)')
+        salt = alt.Chart(pd.DataFrame([{'a': 9500, 'b': 9900}])).mark_rect(color='#f9a8d4', opacity=0.4).encode(y=alt.Y('a:Q', scale=alt.Scale(reverse=True, domain=[0, 11800])), y2='b:Q')
+        col.altair_chart(salt + lines(df, 'X', 'Pressure (psi)', [0, 15000], {'Net load': c, 'Design load ×1.1': c, 'Rating': INK}, bot=11800, height=550), width='stretch')
     st.json({k: (float(v) if isinstance(v, (np.floating,)) else v) for k, v in p.items()})
 
-# ------------------------------------------------------------------ cement & mud
+# ------------------------------------------------------------------ bit design
 with tabs[3]:
+    st.subheader('Bit selection')
+    st.dataframe(pd.DataFrame([{'Section': b['sec'], 'Interval (ft)': f"{b['frm']:,}–{b['to']:,}", 'Bit': b['bit'], 'IADC': b['iadc'],
+                                'Structure': b['blades'], 'Cutters': b['cutters'], 'Formation': b['lith'], 'WOB (klb)': b['wob'],
+                                'RPM': b['rpm'], 'Why': b['why']} for b in BITS]), hide_index=True)
+    st.subheader('Hydraulics – edit the inputs')
+    st.caption('Bit ΔP target = fraction × max standpipe pressure. 0.65 is the theoretical max-bit-HHP optimum; '
+               'lower fractions leave room for parasitic losses that grow with depth, the underreamer and the MPD choke. '
+               'ΔPbit = MW·Q²/(12,031·Cd²·TFA²), Cd = 0.95.')
+    ed = st.data_editor(pd.DataFrame([{'Section': b['sec'], 'Flow (gpm)': b['q'], 'MW (ppg)': b['mw'], 'Max SPP (psi)': b['spp'],
+                                       'Bit ΔP fraction': b['frac'], 'Nozzles': b['nn']} for b in BITS]),
+                        hide_index=True, disabled=['Section'], key='bit_inputs')
+    spread = rig_rate + 18000 + 40000 + 22000 * 3 / 7
+    rows_h, rows_e = [], []
+    for b, (_, r) in zip(BITS, ed.iterrows()):
+        bb = dict(b, q=float(r['Flow (gpm)']), mw=float(r['MW (ppg)']), spp=float(r['Max SPP (psi)']),
+                  frac=float(r['Bit ΔP fraction']), nn=int(r['Nozzles']))
+        h = hydraulics(bb)
+        rows_h.append({'Section': b['sec'], 'Required TFA (in²)': h['tfa_req'], 'Nozzles': h['nozzles'], 'TFA (in²)': h['tfa'],
+                       'Bit ΔP (psi)': h['dp_bit'], '% of SPP': h['pct_spp'], 'Jet velocity (ft/s)': h['vn'], 'Bit HHP': h['hhp'],
+                       'HSI (hp/in²)': h['hsi'], 'Impact force (lbf)': h['impact'], 'Annular vel. vs DP (ft/min)': h['av']})
+        footage = b['to'] - b['frm']; dh = drill_hours(b['frm'], b['to'])
+        runs = 2 if b['sec'].startswith('10-5/8') else 1
+        th = sum(2 * d / 90 / 12 for d in ([b['frm']] + ([9000] if runs == 2 else [])))
+        bc = footage * (28 if b['hole'] >= 17.5 else 17)
+        rows_e.append({'Section': b['sec'], 'Bit runs': runs, 'Footage (ft)': footage, 'Drilling (hr)': round(dh, 1), 'Trips (hr)': round(th, 1),
+                       'Bit cost ($)': bc, 'Cost per foot ($/ft)': round((bc + spread / 24 * (dh + th)) / footage)})
+    st.dataframe(pd.DataFrame(rows_h), hide_index=True)
+    st.subheader('Bit economics')
+    st.caption(f'Cost per foot = (bit cost + spread rate × (drilling + trip hours)) / footage. Spread rate ${spread:,.0f}/day '
+               f'(rig + vessels + services + helicopters). Bit cost from the brief: $28/ft ≥ 17-1/2", $17/ft smaller.')
+    st.dataframe(pd.DataFrame(rows_e), hide_index=True)
+
+# ------------------------------------------------------------------ cement & mud
+with tabs[4]:
     st.subheader('Cement'); cem = pd.DataFrame(R['cem']); st.dataframe(cem, hide_index=True)
     st.write(f"Total slurry {cem['bbl'].sum():,.0f} bbl · cost ${R['cem_cost']:,.0f}")
     st.dataframe(pd.DataFrame(R['cem_checks']).rename(columns={'emw': 'EMW (ppg)', 'fg': 'FG (ppg)'}), hide_index=True)
     st.subheader('Mud'); st.dataframe(pd.DataFrame(R['mud']), hide_index=True)
 
 # ------------------------------------------------------------------ time & AFE
-with tabs[4]:
+with tabs[5]:
     t = [0] + [x[0] for x in R['tvd']]; d = [500] + [x[1] for x in R['tvd']]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(t, d, color=INK, lw=2); depth_axis(ax, 0, 13000); ax.set_xlabel(f'Days from spud (incl. {npt:.1%} NPT)'); ax.set_ylabel('Depth (ft)')
-    st.pyplot(fig)
+    df = pd.DataFrame({'Days': t, 'Depth': d, 'i': range(len(t))})
+    st.altair_chart(alt.Chart(df).mark_line(strokeWidth=2.5, color=INK).encode(
+        x=alt.X('Days:Q', title=f'Days from spud (incl. {npt:.1%} NPT)'), y=ydepth('Depth (ft RKB)', 13000), order='i:Q',
+        tooltip=[alt.Tooltip('Days:Q', format='.1f'), alt.Tooltip('Depth:Q', format=',')]).properties(height=420), width='stretch')
     with st.expander('Operations sequence'):
         st.dataframe(pd.DataFrame(R['ops']), hide_index=True)
     st.subheader('AFE')
@@ -447,13 +584,12 @@ with tabs[4]:
     st.bar_chart(afe.groupby('cat')['cost'].sum())
 
 # ------------------------------------------------------------------ relief well
-with tabs[5]:
+with tabs[6]:
     rw = R['rw']; stn = np.array(rw['stations'])
     a, b = st.columns([1.3, 1])
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.plot(stn[:, 3], stn[:, 2], color='#dc2626', lw=2, label='Relief well'); ax.plot([3500, 3500], [0, 12000], color=INK, lw=2, label='Lucy C6')
-    ax.scatter([3500], [11000], color='#9333ea', zorder=5); depth_axis(ax, 0, 12000); ax.set_xlabel('Vertical section, az 315° (ft)'); ax.set_ylabel('TVD (ft)'); ax.legend()
-    a.pyplot(fig)
+    df = pd.DataFrame(rows('Relief well', stn[:, 3], stn[:, 2]) + rows('Lucy C6', [3500, 3500], [0, 12000]))
+    tgt = alt.Chart(pd.DataFrame([dict(X=3500, Depth=11000)])).mark_point(filled=True, size=120, color='#9333ea').encode(x='X:Q', y=ydepth('TVD (ft)', 12000))
+    a.altair_chart(lines(df, 'X', 'Vertical section toward C6, az 315° (ft)', [-300, 4500], {'Relief well': '#dc2626', 'Lucy C6': INK}, bot=12000, height=550) + tgt, width='stretch')
     b.dataframe(pd.DataFrame([
         {'Point': 'KOP', 'MD': rw['KOP'], 'TVD': rw['KOP'], 'HD': 0, 'Inc': 0},
         {'Point': 'EOB', **{k.upper(): v for k, v in rw['eob1'].items()}, 'Inc': rw['tangent_inc']},
