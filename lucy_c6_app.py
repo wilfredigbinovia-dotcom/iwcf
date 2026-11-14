@@ -107,6 +107,133 @@ def design(spread_per_day, stand_ft=90, trip_spd=12):
 
 
 
+# ------------------------------------------------------------------ other strings engine
+G = 0.052
+
+def make_interp(D, PP, FG, lots):
+    def pp(d): return float(np.interp(d, D, PP))
+    def fg(d):
+        f = float(np.interp(d, D, FG))
+        for ld, _, lv in lots:
+            if abs(ld - d) <= 250: f = min(f, lv)
+        return f
+    return pp, fg
+
+
+# Pipe: OD, wall, yield (psi), weight (lb/ft); ratings from API 5C3 (same formulas as API Ratings sheet)
+def api_collapse(Dod, t, Yp):
+    dt = Dod / t
+    A = 2.8762 + 0.10679e-5 * Yp + 0.21301e-10 * Yp ** 2 - 0.53132e-16 * Yp ** 3
+    B = 0.026233 + 0.50609e-6 * Yp
+    C = -465.93 + 0.030867 * Yp - 0.10483e-7 * Yp ** 2 + 0.36989e-13 * Yp ** 3
+    r = (3 * B / A) / (2 + B / A)
+    F = 46.95e6 * r ** 3 / (Yp * (r - B / A) * (1 - r) ** 2)
+    Gc = F * B / A
+    dt_yp = (math.sqrt((A - 2) ** 2 + 8 * (B + C / Yp)) + (A - 2)) / (2 * (B + C / Yp))
+    dt_pt = Yp * (A - F) / (C + Yp * (B - Gc))
+    dt_te = (2 + B / A) / (3 * B / A)
+    if dt <= dt_yp: return 2 * Yp * ((dt - 1) / dt ** 2)
+    if dt <= dt_pt: return Yp * (A / dt - B) - C
+    if dt <= dt_te: return Yp * (F / dt - Gc)
+    return 46.95e6 / (dt * (dt - 1) ** 2)
+
+
+def ratings(od, t, yp):
+    return dict(burst=round(0.875 * 2 * yp * t / od, -1), collapse=round(api_collapse(od, t, yp), -1),
+                body=yp * math.pi / 4 * (od ** 2 - (od - 2 * t) ** 2) / 1000)
+
+
+def kick_internal(z, shoe, fg_shoe, td, pp_td, ki=0.5, gas=0.1):
+    """Gas kick taken at section TD, gas column to surface, capped by breakdown at the open-hole shoe."""
+    p_frac = fg_shoe * G * shoe - gas * (shoe - z)
+    p_res = (pp_td + ki) * G * td - gas * (td - z)
+    return np.minimum(p_frac, p_res)
+
+
+def lost_circ_internal(z, mw_next, loss_depth, pp_loss):
+    """Fluid level drops until the mud column balances the loss-zone pore pressure."""
+    lf = loss_depth * (1 - pp_loss / mw_next)
+    return np.where(z > lf, mw_next * G * (z - lf), 0.0), lf
+
+
+def cement_external(z, cols):
+    """cols: list of (top, base, ppg) from surface down; hydrostatic of the stacked columns at z."""
+    p = np.zeros_like(z, dtype=float)
+    for top, base, ppg in cols:
+        p += ppg * G * np.clip(np.minimum(z, base) - top, 0, None)
+    return p
+
+
+def design_strings(D, PP, FG, lots, ki=0.5, gas=0.1, backup=8.6, pkf=10.0, overpull=100000, sitp=None):
+    pp, fg = make_interp(D, PP, FG, lots)
+    if sitp is None: sitp = pp(12200) * G * 12200 - gas * 12200
+    out = []
+
+    # ---------------- 20" 133# K-55, 0-2,500, exposed while drilling 17-1/2" (to 5,300)
+    s = dict(name='20" 133# K-55 BTC', top=0, shoe=2500, od=20, t=0.635, yp=55000, wt=133, mw_run=9.2)
+    z = np.arange(s['top'], s['shoe'] + 1, 50.0)
+    burst = {'Gas kick while drilling 17-1/2" (TD 5,300)': kick_internal(z, 2500, fg(2500), 5300, pp(5300), ki, gas)}
+    coll = {'Full evacuation (shallow string)': (s['mw_run'] * G * z, 0 * z),
+            'Cementing (12.5 lead / 15.8 tail vs 9.2 displacement)': (cement_external(z, [(0, 350, 8.6), (350, 2000, 12.5), (2000, 2500, 15.8)]), 9.2 * G * z)}
+    out.append((s, z, burst, coll))
+
+    # ---------------- 13-3/8" 72# L-80, 0-5,300; exposed while drilling 12-1/4" (to 5,900) and 10-5/8" (to 11,800, above liner top 5,000)
+    s = dict(name='13-3/8" 72# L-80 BTC', top=0, shoe=5300, od=13.375, t=0.514, yp=80000, wt=72, mw_run=10.2)
+    z = np.arange(s['top'], s['shoe'] + 1, 50.0)
+    b2 = kick_internal(z, 5900, fg(5900), 11800, pp(11800), ki, gas)
+    b2 = np.where(z <= 5000, b2, np.nan)          # below the 11-3/4" liner top the liner carries the load
+    burst = {'Gas kick while drilling 12-1/4" (TD 5,900)': kick_internal(z, 5300, fg(5300), 5900, pp(5900), ki, gas),
+             'Gas kick while drilling 10-5/8" (TD 11,800), above liner top': b2}
+    lc, lf = lost_circ_internal(z, 10.6, 5500, 8.85)
+    coll = {f'Lost circulation in limestone, level drop {lf:,.0f} ft (loss zone at normal 8.85 ppg)': (s['mw_run'] * G * z, lc),
+            'Cementing (12.5 lead / 15.8 tail vs 10.2 displacement)': (cement_external(z, [(0, 2000, 10.2), (2000, 4300, 12.5), (4300, 5300, 15.8)]), 10.2 * G * z)}
+    out.append((s, z, burst, coll))
+
+    # ---------------- 11-3/4" 60# L-80 liner, 5,000-5,900; exposed while drilling 10-5/8" (to 11,800)
+    s = dict(name='11-3/4" 60# L-80 liner', top=5000, shoe=5900, od=11.75, t=0.489, yp=80000, wt=60, mw_run=10.6)
+    z = np.arange(s['top'], s['shoe'] + 1, 50.0)
+    burst = {'Gas kick while drilling 10-5/8" (TD 11,800)': kick_internal(z, 5900, fg(5900), 11800, pp(11800), ki, gas)}
+    lc, lf = lost_circ_internal(z, 12.8, 11800, pp(11800))
+    coll = {f'Lost circulation at 11,800 ft, level drop {lf:,.0f} ft': (s['mw_run'] * G * z, lc),
+            'Cementing (13.5 lead / 15.8 tail vs 10.6 displacement)': (cement_external(z, [(0, 5000, 10.6), (5000, 5600, 13.5), (5600, 5900, 15.8)]), 10.6 * G * z)}
+    out.append((s, z, burst, coll))
+
+    # ---------------- 7" 32# P-110 liner, 11,500-12,500; production loads
+    s = dict(name='7" 32# P-110 liner', top=11500, shoe=12500, od=7, t=0.453, yp=110000, wt=32, mw_run=13.3)
+    z = np.arange(s['top'], s['shoe'] + 1, 50.0)
+    burst = {'Tubing leak: SITP on packer fluid': sitp + pkf * G * z}
+    coll = {'Full evacuation / depletion (external = run-in MW)': (s['mw_run'] * G * z, 0 * z),
+            'Cementing (16.0 slurry vs 13.3 displacement)': (cement_external(z, [(0, 11500, 13.3), (11500, 12500, 16.0)]), 13.3 * G * z)}
+    out.append((s, z, burst, coll))
+
+    results = []
+    for s, z, burst, coll in out:
+        r = ratings(s['od'], s['t'], s['yp'])
+        ext_b = backup * G * z
+        bcases = {k: v - ext_b for k, v in burst.items()}
+        bstack = np.vstack([np.nan_to_num(v, nan=-1e9) for v in bcases.values()])
+        net_b = bstack.max(axis=0)
+        gov_b = list(bcases)[int(np.argmax(bstack.max(axis=1)))]
+        ccases = {k: e - i for k, (e, i) in coll.items()}
+        cstack = np.vstack(list(ccases.values()))
+        net_c = cstack.max(axis=0)
+        gov_c = list(ccases)[int(np.argmax(cstack.max(axis=1)))]
+        L = s['shoe'] - s['top']
+        bf = 1 - s['mw_run'] / 65.5
+        w_air = s['wt'] * L
+        t_load = w_air * bf + overpull
+        results.append(dict(name=s['name'], top=s['top'], shoe=s['shoe'], rating_burst=r['burst'], rating_collapse=r['collapse'], body_klb=round(r['body']),
+                            z=z.tolist(), net_burst=net_b.round().tolist(), net_collapse=net_c.round().tolist(),
+                            burst_cases={k: np.round(v).tolist() for k, v in bcases.items()},
+                            collapse_cases={k: np.round(v).tolist() for k, v in ccases.items()},
+                            max_burst=float(net_b.max()), max_collapse=float(net_c.max()),
+                            sf_burst=round(r['burst'] / net_b.max(), 2), sf_collapse=round(r['collapse'] / max(net_c.max(), 1), 2),
+                            gov_burst=gov_b, gov_collapse=gov_c,
+                            w_air=round(w_air), bf=round(bf, 3), t_load=round(t_load), sf_tension=round(r['body'] * 1000 / t_load, 2)))
+    return results
+
+
+
 @st.cache_data
 def compute(RIG_NAME, RIG_RATE, NPT, PKF, BACKUP, MW_RUN, CONT):
     G = 0.052
@@ -481,7 +608,7 @@ def lines(df, x, xtitle, xdom, colors, bot=12800, height=650):
 def rows(series, xs, ds, dash='solid'):
     return [dict(Series=series, X=x, Depth=d, i=i, Dash=dash) for i, (x, d) in enumerate(zip(xs, ds))]
 
-tabs = st.tabs(['PP / FG / MW', 'Casing & kick tolerance', 'Production casing', 'Bit design', 'Cement & mud', 'Time & AFE', 'Relief well'])
+tabs = st.tabs(['PP / FG / MW', 'Casing & kick tolerance', 'Casing design', 'Bit design', 'Cement & mud', 'Time & AFE', 'Relief well'])
 
 # ------------------------------------------------------------------ PPFG
 with tabs[0]:
@@ -512,20 +639,62 @@ with tabs[1]:
     st.subheader('Pipe ratings (API 5C3)')
     st.dataframe(pd.DataFrame(R['ratings']).T, width='stretch')
 
-# ------------------------------------------------------------------ production casing
+# ------------------------------------------------------------------ casing design (all strings)
 with tabs[2]:
     p = R['prod']
-    m1, m2, m3 = st.columns(3)
-    m1.metric('Min SF burst', p['min_sf_burst']); m2.metric('Min SF collapse', p['min_sf_collapse']); m3.metric('SF tension', p['sf_tension'])
-    z = np.array(R['z'])
-    lc = st.columns(2)
-    for col, load, rating, ttl, c in [(lc[0], R['net_burst'], R['burst_rating'], 'Burst', '#dc2626'), (lc[1], R['net_collapse'], R['coll_rating'], 'Collapse', '#2563eb')]:
-        load = np.asarray(load, float); rating = np.asarray(rating, float)
-        df = pd.DataFrame(rows('Net load', load, z) + rows('Design load ×1.1', load * 1.1, z, 'dash') + rows('Rating', rating, z))
-        col.markdown(f'**{ttl}** (salt 9,500–9,900 ft shaded)')
-        salt = alt.Chart(pd.DataFrame([{'a': 9500, 'b': 9900}])).mark_rect(color='#f9a8d4', opacity=0.4).encode(y=alt.Y('a:Q', scale=alt.Scale(reverse=True, domain=[0, 11800])), y2='b:Q')
-        col.altair_chart(salt + lines(df, 'X', 'Pressure (psi)', [0, 15000], {'Net load': c, 'Design load ×1.1': c, 'Rating': INK}, bot=11800, height=550), width='stretch')
-    st.json({k: (float(v) if isinstance(v, (np.floating,)) else v) for k, v in p.items()})
+    others = design_strings(R['D'], R['PP'], R['FG'], R['lot'], backup=backup, pkf=pkf, sitp=p['SITP'])
+    st.subheader('All strings – minimum safety factors')
+    summ = [{'String': o['name'], 'Interval (ft)': f"{o['top']:,}–{o['shoe']:,}", 'SF burst': o['sf_burst'], 'SF collapse': o['sf_collapse'],
+             'SF tension': o['sf_tension'], 'Governing burst case': o['gov_burst'], 'Governing collapse case': o['gov_collapse']} for o in others]
+    summ.insert(3, {'String': '9-5/8" 53.5# P-110 / 9-7/8" 62.8# Q-125', 'Interval (ft)': '0–11,800', 'SF burst': p['min_sf_burst'],
+                    'SF collapse': p['min_sf_collapse'], 'SF tension': p['sf_tension'], 'Governing burst case': 'Tubing leak (SITP on packer fluid)',
+                    'Governing collapse case': 'Mobile salt, 1.0 psi/ft overburden'})
+    sdf = pd.DataFrame(summ)
+    st.dataframe(sdf.style.map(lambda v: 'color:#b4311f;font-weight:700' if isinstance(v, float) and v < 1.1 else '', subset=['SF burst', 'SF collapse']), hide_index=True)
+    st.caption('Design factors: burst 1.10, collapse 1.10, tension 1.60. Burst backup = degraded mud / seawater; gas gradient 0.1 psi/ft; '
+               'kick intensity 0.5 ppg. Each string is checked against every section drilled while it is exposed (e.g. the 13-3/8" above the '
+               '11-3/4" liner top while the 10-5/8" section is drilled).')
+    pick = st.selectbox('Show load lines for', ['9-5/8" x 9-7/8" production casing'] + [o['name'] for o in others])
+    if pick.startswith('9-5/8"'):
+        m1, m2, m3 = st.columns(3)
+        m1.metric('Min SF burst', p['min_sf_burst']); m2.metric('Min SF collapse', p['min_sf_collapse']); m3.metric('SF tension', p['sf_tension'])
+        z = np.array(R['z'])
+        lc = st.columns(2)
+        for col, load, rating, ttl, c in [(lc[0], R['net_burst'], R['burst_rating'], 'Burst', '#dc2626'), (lc[1], R['net_collapse'], R['coll_rating'], 'Collapse', '#2563eb')]:
+            load = np.asarray(load, float); rating = np.asarray(rating, float)
+            df = pd.DataFrame(rows('Net load', load, z) + rows('Design load ×1.1', load * 1.1, z, 'dash') + rows('Rating', rating, z))
+            col.markdown(f'**{ttl}** (salt 9,500–9,900 ft shaded)')
+            salt = alt.Chart(pd.DataFrame([{'a': 9500, 'b': 9900}])).mark_rect(color='#f9a8d4', opacity=0.4).encode(y=alt.Y('a:Q', scale=alt.Scale(reverse=True, domain=[0, 11800])), y2='b:Q')
+            col.altair_chart(salt + lines(df, 'X', 'Pressure (psi)', [0, 15000], {'Net load': c, 'Design load ×1.1': c, 'Rating': INK}, bot=11800, height=550), width='stretch')
+        with st.expander('Load case details'):
+            st.json({k: (float(v) if isinstance(v, (np.floating,)) else v) for k, v in p.items()})
+    else:
+        o = next(x for x in others if x['name'] == pick)
+        m1, m2, m3 = st.columns(3)
+        m1.metric('Min SF burst', o['sf_burst']); m2.metric('Min SF collapse', o['sf_collapse']); m3.metric('SF tension', o['sf_tension'])
+        z = np.array(o['z'], float)
+        top, bot = o['top'], o['shoe']
+        lc = st.columns(2)
+        pal = ['#dc2626', '#f97316', '#2563eb', '#0891b2']
+        for col, cases, rating, ttl, cols_ in [(lc[0], o['burst_cases'], o['rating_burst'], 'Burst', pal[:2]), (lc[1], o['collapse_cases'], o['rating_collapse'], 'Collapse', pal[2:])]:
+            recs, colors = [], {}
+            for (k, v), c in zip(cases.items(), cols_):
+                v = np.asarray(v, float); m = ~np.isnan(v)
+                recs += rows(k, v[m], z[m]); colors[k] = c
+            recs += rows('Rating', [rating, rating], [top, bot]); colors['Rating'] = INK
+            df = pd.DataFrame(recs)
+            xmax = max(rating, np.nanmax([np.nanmax(np.asarray(v, float)) for v in cases.values()])) * 1.15
+            ch = alt.Chart(df).mark_line(strokeWidth=2.5).encode(
+                x=alt.X('X:Q', title='Net pressure (psi)', scale=alt.Scale(domain=[0, xmax])),
+                y=alt.Y('Depth:Q', title='Depth (ft TVD RKB)', scale=alt.Scale(reverse=True, domain=[top, bot])),
+                color=alt.Color('Series:N', scale=alt.Scale(domain=list(colors), range=list(colors.values())), legend=alt.Legend(orient='bottom', direction='vertical', labelLimit=500)),
+                order='i:Q', detail='Series:N', tooltip=['Series', alt.Tooltip('X:Q', format=',.0f'), alt.Tooltip('Depth:Q', format=',')]).properties(height=500)
+            col.markdown(f'**{ttl}**'); col.altair_chart(ch, width='stretch')
+        st.write(f"Tension: air weight {o['w_air']:,} lb × BF {o['bf']} + 100,000 lb overpull = {o['t_load']:,} lb vs body yield {o['body_klb']:,} klb")
+        if o['name'].startswith('13-3/8'):
+            st.info('Full evacuation is not used for the 13-3/8": with OBM the fluid level can only fall until the mud column balances the loss-zone '
+                    'pressure. Even assuming the vugular limestone is at normal pressure (8.85 ppg), the level drop is about 900 ft. '
+                    'A full-evacuation check would give SF 0.95, so a contingency would be 13-3/8" 72# with higher collapse (e.g. HC grade).')
 
 # ------------------------------------------------------------------ bit design
 with tabs[3]:
